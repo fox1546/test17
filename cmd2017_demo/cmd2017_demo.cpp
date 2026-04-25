@@ -12,12 +12,14 @@
 #include <map>
 #include <sstream>
 #include <fstream>
+#include <iomanip>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <sapi.h>
 #include <sphelper.h>
 #include <thread>
 #include <mutex>
+#include <memory>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "sapi.lib")
@@ -44,13 +46,35 @@ static lame_encode_flush_t lame_encode_flush = NULL;
 static lame_close_t lame_close = NULL;
 static HMODULE hLameDll = NULL;
 
+class ComInitializer {
+public:
+    ComInitializer() : m_hr(S_OK) {
+        m_hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        if (FAILED(m_hr)) {
+            std::cerr << "[ERROR] CoInitializeEx failed: 0x" << std::hex << m_hr << std::endl;
+        }
+    }
+    
+    ~ComInitializer() {
+        if (SUCCEEDED(m_hr)) {
+            CoUninitialize();
+        }
+    }
+    
+    bool IsInitialized() const { return SUCCEEDED(m_hr); }
+    HRESULT GetHResult() const { return m_hr; }
+
+private:
+    HRESULT m_hr;
+};
+
 bool LoadLameLibrary() {
     hLameDll = LoadLibraryA("lame_enc.dll");
     if (!hLameDll) {
         hLameDll = LoadLibraryA("libmp3lame.dll");
     }
     if (!hLameDll) {
-        std::cerr << "Cannot load lame_enc.dll or libmp3lame.dll" << std::endl;
+        std::cerr << "[INFO] Cannot load lame_enc.dll or libmp3lame.dll" << std::endl;
         return false;
     }
     
@@ -65,12 +89,13 @@ bool LoadLameLibrary() {
     
     if (!lame_init || !lame_set_num_channels || !lame_set_in_samplerate ||
         !lame_init_params || !lame_encode_buffer || !lame_encode_flush || !lame_close) {
-        std::cerr << "Cannot get lame function addresses" << std::endl;
+        std::cerr << "[ERROR] Cannot get lame function addresses" << std::endl;
         FreeLibrary(hLameDll);
         hLameDll = NULL;
         return false;
     }
     
+    std::cout << "[INFO] LAME library loaded successfully" << std::endl;
     return true;
 }
 
@@ -78,6 +103,7 @@ void UnloadLameLibrary() {
     if (hLameDll) {
         FreeLibrary(hLameDll);
         hLameDll = NULL;
+        std::cout << "[INFO] LAME library unloaded" << std::endl;
     }
 }
 
@@ -118,117 +144,243 @@ std::string UrlDecode(const std::string& encoded) {
     return decoded;
 }
 
-std::vector<std::pair<std::wstring, std::wstring>> GetVoiceList() {
+std::string JsonEscape(const std::string& s) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        switch (c) {
+            case '\\': oss << "\\\\"; break;
+            case '"': oss << "\\\""; break;
+            case '\n': oss << "\\n"; break;
+            case '\r': oss << "\\r"; break;
+            case '\t': oss << "\\t"; break;
+            default:
+                if ((unsigned char)c < 32) {
+                    oss << "\\u00" << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)c;
+                } else {
+                    oss << c;
+                }
+        }
+    }
+    return oss.str();
+}
+
+std::vector<std::pair<std::wstring, std::wstring>> GetVoiceListInternal() {
     std::vector<std::pair<std::wstring, std::wstring>> voices;
-    ISpVoice* pVoice = NULL;
+    HRESULT hr;
     
-    if (FAILED(CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void**)&pVoice))) {
+    std::cout << "[DEBUG] GetVoiceListInternal: Starting..." << std::endl;
+    
+    ISpVoice* pVoice = NULL;
+    hr = CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void**)&pVoice);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] CoCreateInstance(CLSID_SpVoice) failed: 0x" << std::hex << hr << std::endl;
         return voices;
     }
+    std::cout << "[DEBUG] ISpVoice created successfully" << std::endl;
     
     ISpObjectTokenCategory* pCategory = NULL;
-    if (SUCCEEDED(CoCreateInstance(CLSID_SpObjectTokenCategory, NULL, CLSCTX_ALL, IID_ISpObjectTokenCategory, (void**)&pCategory))) {
-        pCategory->SetId(SPCAT_VOICES, FALSE);
-        
-        IEnumSpObjectTokens* pEnum = NULL;
-        if (SUCCEEDED(pCategory->EnumTokens(NULL, NULL, &pEnum))) {
-            ISpObjectToken* pToken = NULL;
-            ULONG ulFetched = 0;
-            
-            while (SUCCEEDED(pEnum->Next(1, &pToken, &ulFetched)) && ulFetched == 1) {
-                WCHAR* pId = NULL;
-                if (SUCCEEDED(pToken->GetId(&pId))) {
-                    std::wstring id = pId;
-                    CoTaskMemFree(pId);
-                    
-                    WCHAR* pDesc = NULL;
-                    if (SUCCEEDED(SpGetDescription(pToken, &pDesc))) {
-                        std::wstring desc = pDesc;
-                        CoTaskMemFree(pDesc);
-                        voices.push_back(std::make_pair(id, desc));
-                    }
-                }
-                pToken->Release();
-            }
-            pEnum->Release();
-        }
+    hr = CoCreateInstance(CLSID_SpObjectTokenCategory, NULL, CLSCTX_ALL, IID_ISpObjectTokenCategory, (void**)&pCategory);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] CoCreateInstance(CLSID_SpObjectTokenCategory) failed: 0x" << std::hex << hr << std::endl;
+        pVoice->Release();
+        return voices;
+    }
+    std::cout << "[DEBUG] ISpObjectTokenCategory created successfully" << std::endl;
+    
+    hr = pCategory->SetId(SPCAT_VOICES, FALSE);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] ISpObjectTokenCategory::SetId failed: 0x" << std::hex << hr << std::endl;
         pCategory->Release();
+        pVoice->Release();
+        return voices;
+    }
+    std::cout << "[DEBUG] Category ID set to SPCAT_VOICES" << std::endl;
+    
+    IEnumSpObjectTokens* pEnum = NULL;
+    hr = pCategory->EnumTokens(NULL, NULL, &pEnum);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] ISpObjectTokenCategory::EnumTokens failed: 0x" << std::hex << hr << std::endl;
+        pCategory->Release();
+        pVoice->Release();
+        return voices;
+    }
+    std::cout << "[DEBUG] EnumTokens succeeded" << std::endl;
+    
+    ISpObjectToken* pToken = NULL;
+    ULONG ulFetched = 0;
+    int voiceCount = 0;
+    
+    while (SUCCEEDED(pEnum->Next(1, &pToken, &ulFetched)) && ulFetched == 1) {
+        voiceCount++;
+        std::cout << "[DEBUG] Found voice #" << voiceCount << std::endl;
+        
+        WCHAR* pId = NULL;
+        if (SUCCEEDED(pToken->GetId(&pId))) {
+            std::wstring id = pId;
+            CoTaskMemFree(pId);
+            std::cout << "[DEBUG] Voice ID: " << WideToUtf8(id) << std::endl;
+            
+            WCHAR* pDesc = NULL;
+            if (SUCCEEDED(SpGetDescription(pToken, &pDesc))) {
+                std::wstring desc = pDesc;
+                CoTaskMemFree(pDesc);
+                std::cout << "[DEBUG] Voice Description: " << WideToUtf8(desc) << std::endl;
+                voices.push_back(std::make_pair(id, desc));
+            } else {
+                std::cerr << "[WARNING] SpGetDescription failed for voice" << std::endl;
+            }
+        } else {
+            std::cerr << "[WARNING] ISpObjectToken::GetId failed" << std::endl;
+        }
+        pToken->Release();
     }
     
+    std::cout << "[DEBUG] Total voices found: " << voices.size() << std::endl;
+    
+    pEnum->Release();
+    pCategory->Release();
     pVoice->Release();
+    
     return voices;
 }
 
-std::vector<BYTE> TextToWav(const std::wstring& text, const std::wstring& voiceId) {
+std::vector<BYTE> TextToWavInternal(const std::wstring& text, const std::wstring& voiceId) {
     std::vector<BYTE> wavData;
+    HRESULT hr;
+    
+    std::cout << "[DEBUG] TextToWavInternal: Starting..." << std::endl;
+    std::cout << "[DEBUG] Text length: " << text.length() << std::endl;
+    if (!voiceId.empty()) {
+        std::cout << "[DEBUG] Using voice ID: " << WideToUtf8(voiceId) << std::endl;
+    }
     
     ISpVoice* pVoice = NULL;
-    if (FAILED(CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void**)&pVoice))) {
+    hr = CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void**)&pVoice);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] CoCreateInstance(CLSID_SpVoice) failed: 0x" << std::hex << hr << std::endl;
         return wavData;
     }
+    std::cout << "[DEBUG] ISpVoice created successfully" << std::endl;
     
     if (!voiceId.empty()) {
         ISpObjectToken* pToken = NULL;
-        if (SUCCEEDED(SpGetTokenFromId(voiceId.c_str(), &pToken, FALSE))) {
-            pVoice->SetVoice(pToken);
+        hr = SpGetTokenFromId(voiceId.c_str(), &pToken, FALSE);
+        if (SUCCEEDED(hr)) {
+            hr = pVoice->SetVoice(pToken);
+            if (SUCCEEDED(hr)) {
+                std::cout << "[DEBUG] Voice set successfully" << std::endl;
+            } else {
+                std::cerr << "[WARNING] ISpVoice::SetVoice failed: 0x" << std::hex << hr << std::endl;
+            }
             pToken->Release();
+        } else {
+            std::cerr << "[WARNING] SpGetTokenFromId failed: 0x" << std::hex << hr << std::endl;
         }
     }
     
     CSpStreamFormat format;
     format.AssignFormat(SPSF_22kHz16BitMono);
+    std::cout << "[DEBUG] Stream format set to 22kHz 16-bit Mono" << std::endl;
     
     HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, 0);
     if (!hGlobal) {
+        std::cerr << "[ERROR] GlobalAlloc failed" << std::endl;
         pVoice->Release();
         return wavData;
     }
     
     IStream* pMemStream = NULL;
-    if (FAILED(CreateStreamOnHGlobal(hGlobal, TRUE, &pMemStream))) {
+    hr = CreateStreamOnHGlobal(hGlobal, TRUE, &pMemStream);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] CreateStreamOnHGlobal failed: 0x" << std::hex << hr << std::endl;
         GlobalFree(hGlobal);
         pVoice->Release();
         return wavData;
     }
+    std::cout << "[DEBUG] IStream created successfully" << std::endl;
     
     ISpStream* pSpStream = NULL;
-    if (FAILED(CoCreateInstance(CLSID_SpStream, NULL, CLSCTX_ALL, IID_ISpStream, (void**)&pSpStream))) {
+    hr = CoCreateInstance(CLSID_SpStream, NULL, CLSCTX_ALL, IID_ISpStream, (void**)&pSpStream);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] CoCreateInstance(CLSID_SpStream) failed: 0x" << std::hex << hr << std::endl;
         pMemStream->Release();
         pVoice->Release();
         return wavData;
     }
+    std::cout << "[DEBUG] ISpStream created successfully" << std::endl;
     
-    if (FAILED(pSpStream->SetBaseStream(pMemStream, SPDFID_WaveFormatEx, format.WaveFormatExPtr()))) {
+    hr = pSpStream->SetBaseStream(pMemStream, SPDFID_WaveFormatEx, format.WaveFormatExPtr());
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] ISpStream::SetBaseStream failed: 0x" << std::hex << hr << std::endl;
         pSpStream->Release();
         pMemStream->Release();
         pVoice->Release();
         return wavData;
     }
+    std::cout << "[DEBUG] Base stream set successfully" << std::endl;
     
-    pVoice->SetOutput(pSpStream, TRUE);
+    hr = pVoice->SetOutput(pSpStream, TRUE);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] ISpVoice::SetOutput failed: 0x" << std::hex << hr << std::endl;
+        pSpStream->Release();
+        pMemStream->Release();
+        pVoice->Release();
+        return wavData;
+    }
+    std::cout << "[DEBUG] Output set to stream" << std::endl;
     
-    if (SUCCEEDED(pVoice->Speak(text.c_str(), SPF_DEFAULT, NULL))) {
-        pVoice->WaitUntilDone(INFINITE);
+    std::cout << "[DEBUG] Starting Speak..." << std::endl;
+    hr = pVoice->Speak(text.c_str(), SPF_DEFAULT, NULL);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] ISpVoice::Speak failed: 0x" << std::hex << hr << std::endl;
         pVoice->SetOutput(NULL, FALSE);
-        
-        LARGE_INTEGER liZero = {0};
-        ULARGE_INTEGER ulPos;
-        pMemStream->Seek(liZero, STREAM_SEEK_CUR, &ulPos);
-        DWORD dwSize = (DWORD)ulPos.QuadPart;
-        
-        pMemStream->Seek(liZero, STREAM_SEEK_SET, NULL);
-        
-        wavData.resize(dwSize);
-        ULONG ulRead;
-        pMemStream->Read(wavData.data(), dwSize, &ulRead);
+        pSpStream->Release();
+        pMemStream->Release();
+        pVoice->Release();
+        return wavData;
+    }
+    std::cout << "[DEBUG] Speak succeeded, waiting for completion..." << std::endl;
+    
+    hr = pVoice->WaitUntilDone(INFINITE);
+    if (FAILED(hr)) {
+        std::cerr << "[WARNING] WaitUntilDone failed: 0x" << std::hex << hr << std::endl;
+    }
+    std::cout << "[DEBUG] Speech completed" << std::endl;
+    
+    pVoice->SetOutput(NULL, FALSE);
+    
+    LARGE_INTEGER liZero = {0};
+    ULARGE_INTEGER ulPos;
+    hr = pMemStream->Seek(liZero, STREAM_SEEK_CUR, &ulPos);
+    if (FAILED(hr)) {
+        std::cerr << "[ERROR] IStream::Seek (CUR) failed: 0x" << std::hex << hr << std::endl;
     } else {
-        pVoice->SetOutput(NULL, FALSE);
+        DWORD dwSize = (DWORD)ulPos.QuadPart;
+        std::cout << "[DEBUG] Stream size: " << dwSize << " bytes" << std::endl;
+        
+        if (dwSize > 0) {
+            pMemStream->Seek(liZero, STREAM_SEEK_SET, NULL);
+            
+            wavData.resize(dwSize);
+            ULONG ulRead = 0;
+            hr = pMemStream->Read(wavData.data(), dwSize, &ulRead);
+            if (FAILED(hr)) {
+                std::cerr << "[ERROR] IStream::Read failed: 0x" << std::hex << hr << std::endl;
+                wavData.clear();
+            } else {
+                std::cout << "[DEBUG] Read " << ulRead << " bytes from stream" << std::endl;
+            }
+        } else {
+            std::cerr << "[ERROR] Stream is empty" << std::endl;
+        }
     }
     
     pSpStream->Release();
     pMemStream->Release();
     pVoice->Release();
     
+    std::cout << "[DEBUG] TextToWavInternal finished, WAV data size: " << wavData.size() << std::endl;
     return wavData;
 }
 
@@ -236,11 +388,12 @@ std::vector<BYTE> ConvertWavToMp3(const std::vector<BYTE>& wavData) {
     std::vector<BYTE> mp3Data;
     
     if (!hLameDll || !lame_init) {
-        std::cerr << "LAME library not loaded, cannot convert to MP3" << std::endl;
+        std::cout << "[INFO] LAME library not loaded, skipping MP3 conversion" << std::endl;
         return mp3Data;
     }
     
     if (wavData.size() < 44) {
+        std::cerr << "[ERROR] WAV data too small: " << wavData.size() << " bytes" << std::endl;
         return mp3Data;
     }
     
@@ -249,8 +402,10 @@ std::vector<BYTE> ConvertWavToMp3(const std::vector<BYTE>& wavData) {
     int numChannels = wavHeader[22];
     int bitsPerSample = wavHeader[34];
     
+    std::cout << "[DEBUG] WAV info: " << sampleRate << "Hz, " << numChannels << " channel(s), " << bitsPerSample << " bits" << std::endl;
+    
     if (bitsPerSample != 16) {
-        std::cerr << "Only 16-bit WAV format supported" << std::endl;
+        std::cerr << "[ERROR] Only 16-bit WAV format supported" << std::endl;
         return mp3Data;
     }
     
@@ -264,9 +419,11 @@ std::vector<BYTE> ConvertWavToMp3(const std::vector<BYTE>& wavData) {
     
     const short* pcmData = (const short*)(wavData.data() + dataOffset);
     int pcmSamples = (int)((wavData.size() - dataOffset) / 2 / numChannels);
+    std::cout << "[DEBUG] PCM samples: " << pcmSamples << std::endl;
     
     auto gf = lame_init();
     if (!gf) {
+        std::cerr << "[ERROR] lame_init failed" << std::endl;
         return mp3Data;
     }
     
@@ -277,6 +434,7 @@ std::vector<BYTE> ConvertWavToMp3(const std::vector<BYTE>& wavData) {
     }
     
     if (lame_init_params(gf) < 0) {
+        std::cerr << "[ERROR] lame_init_params failed" << std::endl;
         lame_close(gf);
         return mp3Data;
     }
@@ -292,6 +450,7 @@ std::vector<BYTE> ConvertWavToMp3(const std::vector<BYTE>& wavData) {
     }
     
     if (mp3Size < 0) {
+        std::cerr << "[ERROR] lame_encode_buffer failed: " << mp3Size << std::endl;
         lame_close(gf);
         mp3Data.clear();
         return mp3Data;
@@ -305,6 +464,8 @@ std::vector<BYTE> ConvertWavToMp3(const std::vector<BYTE>& wavData) {
     lame_close(gf);
     
     mp3Data.resize(mp3Size);
+    std::cout << "[DEBUG] MP3 size: " << mp3Size << " bytes" << std::endl;
+    
     return mp3Data;
 }
 
@@ -349,11 +510,7 @@ std::string GetHtmlPage() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Text to Speech</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Microsoft YaHei', Arial, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -371,154 +528,73 @@ std::string GetHtmlPage() {
             width: 100%;
             max-width: 600px;
         }
-        h1 {
-            text-align: center;
-            color: #333;
-            margin-bottom: 30px;
-            font-size: 28px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 8px;
-            color: #555;
-            font-weight: 600;
-        }
+        h1 { text-align: center; color: #333; margin-bottom: 30px; font-size: 28px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; color: #555; font-weight: 600; }
         textarea {
-            width: 100%;
-            height: 150px;
-            padding: 15px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            font-size: 16px;
-            resize: vertical;
-            transition: border-color 0.3s;
-            font-family: inherit;
+            width: 100%; height: 150px; padding: 15px;
+            border: 2px solid #e0e0e0; border-radius: 8px;
+            font-size: 16px; resize: vertical;
+            transition: border-color 0.3s; font-family: inherit;
         }
-        textarea:focus {
-            outline: none;
-            border-color: #667eea;
-        }
+        textarea:focus { outline: none; border-color: #667eea; }
         select {
-            width: 100%;
-            padding: 12px 15px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            font-size: 16px;
-            background: white;
-            cursor: pointer;
-            transition: border-color 0.3s;
+            width: 100%; padding: 12px 15px;
+            border: 2px solid #e0e0e0; border-radius: 8px;
+            font-size: 16px; background: white;
+            cursor: pointer; transition: border-color 0.3s;
         }
-        select:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        .btn-group {
-            display: flex;
-            gap: 15px;
-            margin-top: 30px;
-        }
+        select:focus { outline: none; border-color: #667eea; }
+        .btn-group { display: flex; gap: 15px; margin-top: 30px; }
         button {
-            flex: 1;
-            padding: 15px;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
+            flex: 1; padding: 15px; border: none; border-radius: 8px;
+            font-size: 16px; font-weight: 600; cursor: pointer;
             transition: all 0.3s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
         }
         .btn-play {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
         }
-        .btn-play:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
-        }
+        .btn-play:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4); }
         .btn-download {
             background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
             color: white;
         }
-        .btn-download:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(17, 153, 142, 0.4);
-        }
-        button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-            transform: none;
-            box-shadow: none;
-        }
+        .btn-download:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(17, 153, 142, 0.4); }
+        button:disabled { background: #ccc; cursor: not-allowed; transform: none; box-shadow: none; }
         .status {
-            margin-top: 20px;
-            padding: 15px;
-            border-radius: 8px;
-            text-align: center;
-            display: none;
+            margin-top: 20px; padding: 15px; border-radius: 8px;
+            text-align: center; display: none;
         }
-        .status.loading {
-            background: #e3f2fd;
-            color: #1976d2;
-            display: block;
-        }
-        .status.error {
-            background: #ffebee;
-            color: #c62828;
-            display: block;
-        }
-        .status.success {
-            background: #e8f5e9;
-            color: #2e7d32;
-            display: block;
-        }
-        .audio-container {
-            margin-top: 20px;
-            display: none;
-        }
-        audio {
-            width: 100%;
-        }
+        .status.loading { background: #e3f2fd; color: #1976d2; display: block; }
+        .status.error { background: #ffebee; color: #c62828; display: block; }
+        .status.success { background: #e8f5e9; color: #2e7d32; display: block; }
+        .audio-container { margin-top: 20px; display: none; }
+        audio { width: 100%; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Text to Speech</h1>
-        
         <div class="form-group">
             <label for="voice">Select Voice:</label>
             <select id="voice">
                 <option value="">Loading...</option>
             </select>
         </div>
-        
         <div class="form-group">
             <label for="text">Enter Text:</label>
             <textarea id="text" placeholder="Enter text to convert..."></textarea>
         </div>
-        
         <div class="btn-group">
-            <button class="btn-play" id="btnPlay">
-                <span>Play</span> Convert
-            </button>
-            <button class="btn-download" id="btnDownload">
-                <span>Download</span> MP3
-            </button>
+            <button class="btn-play" id="btnPlay">Play Convert</button>
+            <button class="btn-download" id="btnDownload">Download MP3</button>
         </div>
-        
         <div class="status" id="status"></div>
-        
         <div class="audio-container" id="audioContainer">
             <audio id="audioPlayer" controls></audio>
         </div>
     </div>
-    
     <script>
         const textarea = document.getElementById('text');
         const voiceSelect = document.getElementById('voice');
@@ -527,16 +603,11 @@ std::string GetHtmlPage() {
         const statusDiv = document.getElementById('status');
         const audioContainer = document.getElementById('audioContainer');
         const audioPlayer = document.getElementById('audioPlayer');
-        
         let currentAudioUrl = null;
         
         function showStatus(message, type) {
             statusDiv.textContent = message;
             statusDiv.className = 'status ' + type;
-        }
-        
-        function hideStatus() {
-            statusDiv.className = 'status';
         }
         
         function setButtonsEnabled(enabled) {
@@ -548,24 +619,25 @@ std::string GetHtmlPage() {
             try {
                 const response = await fetch('/voices');
                 const voices = await response.json();
+                console.log('Voices loaded:', voices);
                 
                 voiceSelect.innerHTML = '';
-                voices.forEach(voice => {
-                    const option = document.createElement('option');
-                    option.value = voice.id;
-                    option.textContent = voice.name;
-                    voiceSelect.appendChild(option);
-                });
-                
                 if (voices.length === 0) {
                     const option = document.createElement('option');
                     option.value = '';
-                    option.textContent = 'No voices available';
+                    option.textContent = 'No voices available (check console)';
                     voiceSelect.appendChild(option);
+                } else {
+                    voices.forEach(voice => {
+                        const option = document.createElement('option');
+                        option.value = voice.id;
+                        option.textContent = voice.name;
+                        voiceSelect.appendChild(option);
+                    });
                 }
             } catch (error) {
                 console.error('Failed to load voices:', error);
-                voiceSelect.innerHTML = '<option value="">Load failed</option>';
+                voiceSelect.innerHTML = '<option value="">Load failed: ' + error.message + '</option>';
             }
         }
         
@@ -578,11 +650,9 @@ std::string GetHtmlPage() {
             
             const voiceId = voiceSelect.value;
             setButtonsEnabled(false);
-            hideStatus();
+            showStatus('Converting...', 'loading');
             
             try {
-                showStatus('Converting...', 'loading');
-                
                 const formData = new URLSearchParams();
                 formData.append('text', text);
                 if (voiceId) {
@@ -590,19 +660,23 @@ std::string GetHtmlPage() {
                 }
                 
                 const endpoint = format === 'wav' ? '/speak' : '/download';
+                console.log('Sending request to:', endpoint);
+                
                 const response = await fetch(endpoint, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded'
-                    },
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: formData
                 });
                 
+                console.log('Response status:', response.status);
+                
                 if (!response.ok) {
-                    throw new Error('Conversion failed');
+                    const errorText = await response.text();
+                    throw new Error(errorText || 'Server error: ' + response.status);
                 }
                 
                 const blob = await response.blob();
+                console.log('Received blob:', blob.size, 'bytes, type:', blob.type);
                 
                 if (currentAudioUrl) {
                     URL.revokeObjectURL(currentAudioUrl);
@@ -618,7 +692,7 @@ std::string GetHtmlPage() {
                 } else {
                     const a = document.createElement('a');
                     a.href = currentAudioUrl;
-                    a.download = 'tts_' + Date.now() + '.mp3';
+                    a.download = 'tts_' + Date.now() + (blob.type === 'audio/mpeg' ? '.mp3' : '.wav');
                     document.body.appendChild(a);
                     a.click();
                     document.body.removeChild(a);
@@ -626,6 +700,7 @@ std::string GetHtmlPage() {
                 }
                 
             } catch (error) {
+                console.error('Conversion error:', error);
                 showStatus('Conversion failed: ' + error.message, 'error');
             } finally {
                 setButtonsEnabled(true);
@@ -703,6 +778,16 @@ std::map<std::string, std::string> ParseFormData(const std::string& body) {
 }
 
 void HandleClient(SOCKET clientSocket) {
+    std::cout << "\n[INFO] ===== New Client Request =====" << std::endl;
+    
+    ComInitializer comInit;
+    if (!comInit.IsInitialized()) {
+        std::cerr << "[ERROR] Failed to initialize COM for client thread" << std::endl;
+        closesocket(clientSocket);
+        return;
+    }
+    std::cout << "[DEBUG] COM initialized for client thread" << std::endl;
+    
     char buffer[MAX_BUFFER];
     std::string request;
     int bytesReceived;
@@ -717,6 +802,7 @@ void HandleClient(SOCKET clientSocket) {
     }
     
     if (bytesReceived <= 0 && request.empty()) {
+        std::cerr << "[ERROR] No data received from client" << std::endl;
         closesocket(clientSocket);
         return;
     }
@@ -725,31 +811,38 @@ void HandleClient(SOCKET clientSocket) {
     std::map<std::string, std::string> headers;
     ParseRequest(request, method, path, headers, body);
     
-    std::cout << "[" << method << "] " << path << std::endl;
+    std::cout << "[INFO] " << method << " " << path << std::endl;
     
     std::string response;
     
     if (method == "GET" && (path == "/" || path == "/index.html")) {
+        std::cout << "[DEBUG] Serving HTML page" << std::endl;
         std::string html = GetHtmlPage();
         response = GetHttpResponse(html, "text/html; charset=utf-8");
     }
     else if (method == "GET" && path == "/voices") {
-        auto voices = GetVoiceList();
+        std::cout << "[DEBUG] Getting voice list" << std::endl;
+        auto voices = GetVoiceListInternal();
+        
         std::ostringstream json;
         json << "[";
         for (size_t i = 0; i < voices.size(); i++) {
             if (i > 0) json << ",";
-            json << "{\"id\":\"" << WideToUtf8(voices[i].first) << "\",";
-            json << "\"name\":\"" << WideToUtf8(voices[i].second) << "\"}";
+            json << "{\"id\":\"" << JsonEscape(WideToUtf8(voices[i].first)) << "\",";
+            json << "\"name\":\"" << JsonEscape(WideToUtf8(voices[i].second)) << "\"}";
         }
         json << "]";
+        
+        std::cout << "[DEBUG] Voice list JSON: " << json.str() << std::endl;
         response = GetHttpResponse(json.str(), "application/json; charset=utf-8");
     }
     else if (method == "POST" && (path == "/speak" || path == "/download")) {
+        std::cout << "[DEBUG] Processing speech request" << std::endl;
         auto formData = ParseFormData(body);
         auto textIt = formData.find("text");
         
         if (textIt == formData.end() || textIt->second.empty()) {
+            std::cerr << "[ERROR] No text provided" << std::endl;
             response = GetHttpResponse("Please enter text", "text/plain", 400);
         } else {
             std::wstring text = Utf8ToWide(textIt->second);
@@ -759,16 +852,22 @@ void HandleClient(SOCKET clientSocket) {
                 voiceId = Utf8ToWide(voiceIt->second);
             }
             
-            std::vector<BYTE> audioData = TextToWav(text, voiceId);
+            std::cout << "[DEBUG] Converting text: " << textIt->second << std::endl;
+            std::vector<BYTE> audioData = TextToWavInternal(text, voiceId);
             
             if (audioData.empty()) {
-                response = GetHttpResponse("Speech conversion failed", "text/plain", 500);
+                std::cerr << "[ERROR] TextToWavInternal returned empty data" << std::endl;
+                response = GetHttpResponse("Speech conversion failed - check server logs for details", "text/plain", 500);
             } else {
+                std::cout << "[INFO] WAV generated successfully, size: " << audioData.size() << " bytes" << std::endl;
+                
                 if (path == "/download") {
                     std::vector<BYTE> mp3Data = ConvertWavToMp3(audioData);
                     if (!mp3Data.empty()) {
+                        std::cout << "[INFO] MP3 conversion successful" << std::endl;
                         response = GetBinaryHttpResponse(mp3Data, "audio/mpeg", "attachment; filename=tts.mp3");
                     } else {
+                        std::cout << "[INFO] Falling back to WAV for download" << std::endl;
                         response = GetBinaryHttpResponse(audioData, "audio/wav", "attachment; filename=tts.wav");
                     }
                 } else {
@@ -778,42 +877,62 @@ void HandleClient(SOCKET clientSocket) {
         }
     }
     else {
+        std::cout << "[DEBUG] 404 Not Found: " << path << std::endl;
         response = GetHttpResponse("404 Not Found", "text/plain", 404);
     }
     
+    std::cout << "[DEBUG] Sending response, size: " << response.length() << " bytes" << std::endl;
     send(clientSocket, response.c_str(), (int)response.length(), 0);
     closesocket(clientSocket);
+    
+    std::cout << "[INFO] ===== Request Complete =====" << std::endl;
 }
 
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     
-    std::cout << "Initializing COM..." << std::endl;
-    CoInitialize(NULL);
+    std::cout << "========================================" << std::endl;
+    std::cout << "Text-to-Speech Server" << std::endl;
+    std::cout << "========================================" << std::endl;
     
-    std::cout << "Loading LAME encoder..." << std::endl;
-    LoadLameLibrary();
-    if (!hLameDll) {
-        std::cout << "Warning: lame_enc.dll not found, download will use WAV format" << std::endl;
-        std::cout << "For MP3 support, place lame_enc.dll or libmp3lame.dll in the same directory" << std::endl;
-    } else {
-        std::cout << "LAME encoder loaded successfully, MP3 format supported" << std::endl;
+    std::cout << "\n[INFO] Initializing main thread COM..." << std::endl;
+    ComInitializer mainComInit;
+    if (!mainComInit.IsInitialized()) {
+        std::cerr << "[ERROR] Failed to initialize main thread COM" << std::endl;
+        return 1;
     }
     
+    std::cout << "\n[INFO] Loading LAME encoder..." << std::endl;
+    LoadLameLibrary();
+    
+    std::cout << "\n[INFO] Testing SAPI in main thread..." << std::endl;
+    {
+        ComInitializer testCom;
+        if (testCom.IsInitialized()) {
+            auto testVoices = GetVoiceListInternal();
+            std::cout << "[INFO] Main thread test - Voices available: " << testVoices.size() << std::endl;
+            for (size_t i = 0; i < testVoices.size(); i++) {
+                std::cout << "  [" << i << "] " << WideToUtf8(testVoices[i].second) << std::endl;
+            }
+        }
+    }
+    
+    std::cout << "\n[INFO] Initializing Winsock..." << std::endl;
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "WSAStartup failed" << std::endl;
-        CoUninitialize();
+        std::cerr << "[ERROR] WSAStartup failed" << std::endl;
         return 1;
     }
     
     SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket == INVALID_SOCKET) {
-        std::cerr << "socket creation failed" << std::endl;
+        std::cerr << "[ERROR] socket creation failed" << std::endl;
         WSACleanup();
-        CoUninitialize();
         return 1;
     }
+    
+    int optval = 1;
+    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
     
     sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
@@ -821,23 +940,21 @@ int main() {
     serverAddr.sin_port = htons(PORT);
     
     if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        std::cerr << "bind failed" << std::endl;
+        std::cerr << "[ERROR] bind failed" << std::endl;
         closesocket(serverSocket);
         WSACleanup();
-        CoUninitialize();
         return 1;
     }
     
     if (listen(serverSocket, 10) == SOCKET_ERROR) {
-        std::cerr << "listen failed" << std::endl;
+        std::cerr << "[ERROR] listen failed" << std::endl;
         closesocket(serverSocket);
         WSACleanup();
-        CoUninitialize();
         return 1;
     }
     
-    std::cout << "========================================" << std::endl;
-    std::cout << "Text-to-Speech Server Started" << std::endl;
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "Server Started Successfully!" << std::endl;
     std::cout << "Listening on port: " << PORT << std::endl;
     std::cout << "Please visit: http://localhost:" << PORT << std::endl;
     std::cout << "========================================" << std::endl;
@@ -848,13 +965,13 @@ int main() {
         SOCKET clientSocket = accept(serverSocket, (sockaddr*)&clientAddr, &clientLen);
         
         if (clientSocket == INVALID_SOCKET) {
-            std::cerr << "accept failed" << std::endl;
+            std::cerr << "[ERROR] accept failed" << std::endl;
             continue;
         }
         
         char clientIP[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
-        std::cout << "Client connected: " << clientIP << ":" << ntohs(clientAddr.sin_port) << std::endl;
+        std::cout << "\n[INFO] New connection from: " << clientIP << ":" << ntohs(clientAddr.sin_port) << std::endl;
         
         std::thread t(HandleClient, clientSocket);
         t.detach();
@@ -863,7 +980,6 @@ int main() {
     closesocket(serverSocket);
     WSACleanup();
     UnloadLameLibrary();
-    CoUninitialize();
     
     return 0;
 }
