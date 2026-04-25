@@ -13,6 +13,7 @@
 #include <sstream>
 #include <fstream>
 #include <iomanip>
+#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <sapi.h>
@@ -245,6 +246,57 @@ std::vector<std::pair<std::wstring, std::wstring>> GetVoiceListInternal() {
     return voices;
 }
 
+std::wstring GetTempFileName() {
+    WCHAR tempPath[MAX_PATH];
+    WCHAR tempFile[MAX_PATH];
+    
+    GetTempPathW(MAX_PATH, tempPath);
+    GetTempFileNameW(tempPath, L"tts", 0, tempFile);
+    
+    return std::wstring(tempFile);
+}
+
+std::vector<BYTE> ReadFileToVector(const std::wstring& filename) {
+    std::vector<BYTE> data;
+    
+    HANDLE hFile = CreateFileW(
+        filename.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    
+    if (hFile == INVALID_HANDLE_VALUE) {
+        std::cerr << "[ERROR] Cannot open file: " << WideToUtf8(filename) << std::endl;
+        return data;
+    }
+    
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(hFile, &fileSize)) {
+        std::cerr << "[ERROR] Cannot get file size" << std::endl;
+        CloseHandle(hFile);
+        return data;
+    }
+    
+    if (fileSize.QuadPart > 0) {
+        data.resize((size_t)fileSize.QuadPart);
+        
+        DWORD bytesRead = 0;
+        if (!ReadFile(hFile, data.data(), (DWORD)fileSize.QuadPart, &bytesRead, NULL)) {
+            std::cerr << "[ERROR] Cannot read file" << std::endl;
+            data.clear();
+        } else {
+            std::cout << "[DEBUG] Read " << bytesRead << " bytes from file" << std::endl;
+        }
+    }
+    
+    CloseHandle(hFile);
+    return data;
+}
+
 std::vector<BYTE> TextToWavInternal(const std::wstring& text, const std::wstring& voiceId) {
     std::vector<BYTE> wavData;
     HRESULT hr;
@@ -279,53 +331,29 @@ std::vector<BYTE> TextToWavInternal(const std::wstring& text, const std::wstring
         }
     }
     
+    std::wstring tempFile = GetTempFileName();
+    std::cout << "[DEBUG] Temp file: " << WideToUtf8(tempFile) << std::endl;
+    
     CSpStreamFormat format;
     format.AssignFormat(SPSF_22kHz16BitMono);
     std::cout << "[DEBUG] Stream format set to 22kHz 16-bit Mono" << std::endl;
     
-    HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, 0);
-    if (!hGlobal) {
-        std::cerr << "[ERROR] GlobalAlloc failed" << std::endl;
-        pVoice->Release();
-        return wavData;
-    }
-    
-    IStream* pMemStream = NULL;
-    hr = CreateStreamOnHGlobal(hGlobal, TRUE, &pMemStream);
+    ISpStream* pStream = NULL;
+    hr = SPBindToFile(tempFile.c_str(), SPFM_CREATE_ALWAYS, &pStream, &format.FormatId(), format.WaveFormatExPtr(), SPFEI_ALL_EVENTS);
     if (FAILED(hr)) {
-        std::cerr << "[ERROR] CreateStreamOnHGlobal failed: 0x" << std::hex << hr << std::endl;
-        GlobalFree(hGlobal);
+        std::cerr << "[ERROR] SPBindToFile failed: 0x" << std::hex << hr << std::endl;
         pVoice->Release();
+        DeleteFileW(tempFile.c_str());
         return wavData;
     }
-    std::cout << "[DEBUG] IStream created successfully" << std::endl;
+    std::cout << "[DEBUG] SPBindToFile succeeded" << std::endl;
     
-    ISpStream* pSpStream = NULL;
-    hr = CoCreateInstance(CLSID_SpStream, NULL, CLSCTX_ALL, IID_ISpStream, (void**)&pSpStream);
-    if (FAILED(hr)) {
-        std::cerr << "[ERROR] CoCreateInstance(CLSID_SpStream) failed: 0x" << std::hex << hr << std::endl;
-        pMemStream->Release();
-        pVoice->Release();
-        return wavData;
-    }
-    std::cout << "[DEBUG] ISpStream created successfully" << std::endl;
-    
-    hr = pSpStream->SetBaseStream(pMemStream, SPDFID_WaveFormatEx, format.WaveFormatExPtr());
-    if (FAILED(hr)) {
-        std::cerr << "[ERROR] ISpStream::SetBaseStream failed: 0x" << std::hex << hr << std::endl;
-        pSpStream->Release();
-        pMemStream->Release();
-        pVoice->Release();
-        return wavData;
-    }
-    std::cout << "[DEBUG] Base stream set successfully" << std::endl;
-    
-    hr = pVoice->SetOutput(pSpStream, TRUE);
+    hr = pVoice->SetOutput(pStream, TRUE);
     if (FAILED(hr)) {
         std::cerr << "[ERROR] ISpVoice::SetOutput failed: 0x" << std::hex << hr << std::endl;
-        pSpStream->Release();
-        pMemStream->Release();
+        pStream->Release();
         pVoice->Release();
+        DeleteFileW(tempFile.c_str());
         return wavData;
     }
     std::cout << "[DEBUG] Output set to stream" << std::endl;
@@ -335,9 +363,9 @@ std::vector<BYTE> TextToWavInternal(const std::wstring& text, const std::wstring
     if (FAILED(hr)) {
         std::cerr << "[ERROR] ISpVoice::Speak failed: 0x" << std::hex << hr << std::endl;
         pVoice->SetOutput(NULL, FALSE);
-        pSpStream->Release();
-        pMemStream->Release();
+        pStream->Release();
         pVoice->Release();
+        DeleteFileW(tempFile.c_str());
         return wavData;
     }
     std::cout << "[DEBUG] Speak succeeded, waiting for completion..." << std::endl;
@@ -349,36 +377,14 @@ std::vector<BYTE> TextToWavInternal(const std::wstring& text, const std::wstring
     std::cout << "[DEBUG] Speech completed" << std::endl;
     
     pVoice->SetOutput(NULL, FALSE);
-    
-    LARGE_INTEGER liZero = {0};
-    ULARGE_INTEGER ulPos;
-    hr = pMemStream->Seek(liZero, STREAM_SEEK_CUR, &ulPos);
-    if (FAILED(hr)) {
-        std::cerr << "[ERROR] IStream::Seek (CUR) failed: 0x" << std::hex << hr << std::endl;
-    } else {
-        DWORD dwSize = (DWORD)ulPos.QuadPart;
-        std::cout << "[DEBUG] Stream size: " << dwSize << " bytes" << std::endl;
-        
-        if (dwSize > 0) {
-            pMemStream->Seek(liZero, STREAM_SEEK_SET, NULL);
-            
-            wavData.resize(dwSize);
-            ULONG ulRead = 0;
-            hr = pMemStream->Read(wavData.data(), dwSize, &ulRead);
-            if (FAILED(hr)) {
-                std::cerr << "[ERROR] IStream::Read failed: 0x" << std::hex << hr << std::endl;
-                wavData.clear();
-            } else {
-                std::cout << "[DEBUG] Read " << ulRead << " bytes from stream" << std::endl;
-            }
-        } else {
-            std::cerr << "[ERROR] Stream is empty" << std::endl;
-        }
-    }
-    
-    pSpStream->Release();
-    pMemStream->Release();
+    pStream->Release();
     pVoice->Release();
+    
+    wavData = ReadFileToVector(tempFile);
+    std::cout << "[DEBUG] Read " << wavData.size() << " bytes from temp file" << std::endl;
+    
+    DeleteFileW(tempFile.c_str());
+    std::cout << "[DEBUG] Temp file deleted" << std::endl;
     
     std::cout << "[DEBUG] TextToWavInternal finished, WAV data size: " << wavData.size() << std::endl;
     return wavData;
